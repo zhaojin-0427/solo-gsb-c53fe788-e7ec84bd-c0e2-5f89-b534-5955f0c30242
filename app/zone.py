@@ -58,12 +58,21 @@ class ParsedZone:
     records: list[RR]
     rrsets: dict[dns.name.Name, dict[int, list[RR]]] = field(default_factory=dict)
     soa: RR | None = None
+    # 存在性闭包：全部属主名及其直到区域顶点的祖先。祖先中自身没有
+    # RRset 的节点即空非终结点（empty non-terminal）——它们“存在”，
+    # 参与最近包围名与通配源判定；但某节点的叶子下级不在集合内，
+    # 存在性不会凭“父节点有数据”凭空向下虚构。
+    exists: set[dns.name.Name] = field(default_factory=set)
 
     def rdatasets(self, owner: dns.name.Name) -> dict[int, list[RR]]:
         return self.rrsets.get(owner, {})
 
     def has(self, owner: dns.name.Name) -> bool:
         return owner in self.rrsets
+
+    def exists_name(self, name: dns.name.Name) -> bool:
+        """name 是否存在于区域树中（有 RRset，或为空非终结点）。"""
+        return name in self.exists
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +334,17 @@ def _build(origin, raw_records, label: str) -> ParsedZone:
             if pz.soa is not None:
                 raise ZoneError(f"{label}: 区域内出现多个 SOA 记录")
             pz.soa = rr
+
+    # 存在性闭包：每个属主连同它到顶点的全部祖先都“存在”；
+    # 没有 RRset 的祖先即空非终结点。属主均已校验为域内名，
+    # 上溯必然在顶点终止。
+    for owner in pz.rrsets:
+        cur = owner
+        while True:
+            pz.exists.add(cur)
+            if cur == origin:
+                break
+            cur = cur.parent()
 
     if pz.soa is None:
         raise ZoneError(f"{label}: 区域缺少 SOA 记录，无法构成区域")

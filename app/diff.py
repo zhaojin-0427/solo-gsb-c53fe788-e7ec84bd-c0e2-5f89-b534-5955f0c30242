@@ -300,8 +300,17 @@ def analyze(
 def _emit_patterns(markers, resolved, changed_nodes, changed_star, changed_deep):
     """生成互斥完备的模式。
 
-    每个变化单元对应一个锥（exact / star / sub）。按从具体到宽泛的顺序
-    发射；每个锥减去所有已发射、且位于其内部的更具体锥，从而保证：
+    每个变化单元对应一个锥（exact / star / sub）。锥的语义集合大于
+    本单元探针实际见证的空隙：
+
+    * ``star(P)`` 含 P 的全部一标签下级，而 star 探针只见证未标记的
+      空隙——已标记下级各有精确单元；
+    * ``sub(P)`` 含 P 本身、一标签层与全部已标记子树，而 deep 探针只
+      见证“进入未标记子树后 ≥2 层”的空隙——标记 trie 前缀闭合，P 的
+      每个已标记后代都落在某个已标记直接下级之下。
+
+    因此发射每个锥时，把“探针未见证的边界”显式排除（这些边界各自
+    拥有独立的变化判定，若变化会单独成模式）。如此保证：
 
     * 模式内任一 (名称,类型) 的两版应答都变化；
     * 模式外的名称要么应答未变，要么属于另一个模式；
@@ -319,61 +328,32 @@ def _emit_patterns(markers, resolved, changed_nodes, changed_star, changed_deep)
         a1, a2, _ = resolved[("deep", node)]
         raw.append((len(node), Cone.sub(node), a1, a2))
 
-    # 深度优先：先具体后宽泛；同深度按标签排序保证输出稳定。
+    # 每个节点的已标记直接下级（star/deep 探针都不见证它们）。
+    marked_children: dict[tuple[str, ...], set[str]] = {}
+    for m in markers:
+        if m:
+            marked_children.setdefault(m[1:], set()).add(m[0])
+
+    # 排序仅为输出稳定（从具体到宽泛）；正确性由边界排除保证。
     raw.sort(key=lambda x: (-x[0], x[1].kind, x[1].labels))
 
-    emitted: list[Cone] = []
     patterns: list[Pattern] = []
-    for depth, cone, a1, a2 in raw:
+    for _depth, cone, a1, a2 in raw:
         kind = {
             "exact": "exact", "star": "star", "sub": "deep"
         }[cone.kind]
-        exclude = [c for c in emitted if _cone_within(c, cone)]
+        children = sorted(marked_children.get(cone.labels, ()))
+        if cone.kind == "sub":
+            exclude = [Cone.exact(cone.labels), Cone.star(cone.labels)]
+            exclude += [Cone.sub((q,) + cone.labels) for q in children]
+        elif cone.kind == "star":
+            exclude = [Cone.exact((q,) + cone.labels) for q in children]
+        else:
+            exclude = []
         patterns.append(Pattern(
             scope=cone, exclude=exclude,
             witness=a1.qname, witness_kind=kind,
             baseline=a1, candidate=a2,
         ))
-        emitted.append(cone)
 
     return patterns
-
-
-def _suffix(child: tuple[str, ...], parent: tuple[str, ...]) -> bool:
-    """名称 child 是否以 parent 为右侧后缀（含相等）。"""
-    return child == parent or (
-        len(child) > len(parent) and child[len(child) - len(parent):] == parent
-    )
-
-
-def _depth_within(child: tuple[str, ...], parent: tuple[str, ...]) -> int:
-    """child 比 parent 深几个标签；不是后缀时返回 -1。"""
-    if not _suffix(child, parent):
-        return -1
-    return len(child) - len(parent)
-
-
-def _cone_within(inner: Cone, outer: Cone) -> bool:
-    """inner 名称集合是否包含于 outer 名称集合。
-
-    名称集合语义（P 为锥的基准标签序列）：
-      exact(P) = {P}
-      star(P)  = 恰好比 P 深一层的名称（*.P，单层）
-      sub(P)   = P 及其任意多层下级（**.P，零或多层）
-    """
-    P, Q = inner.labels, outer.labels
-    if outer.kind == "exact":
-        return inner.kind == "exact" and P == Q
-    if outer.kind == "star":
-        if inner.kind == "exact":
-            return _depth_within(P, Q) == 1
-        if inner.kind == "star":
-            return P == Q
-        return False  # sub 含零层/多层，不可能只落在单层
-    # outer.kind == "sub"
-    if inner.kind == "exact":
-        return _depth_within(P, Q) >= 0
-    if inner.kind == "star":
-        # *.P 的全部名字都在 P 之下；P==Q 或 P 为 Q 下级时落入 sub(Q)。
-        return _depth_within(P, Q) >= 0
-    return _depth_within(P, Q) >= 0

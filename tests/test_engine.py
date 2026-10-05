@@ -142,32 +142,44 @@ def test_exact_and_cname_chain():
 def test_nodata_vs_ent_vs_nxdomain():
     r = res(zone(BASE))
     assert ask(r, "host", "NS").termination == "noerror_nodata"
-    assert ask(r, "x.ent", "A").termination == "ent_nodata"
+    # wild 自身无 RRset，但有后代 *.wild → 真实空非终结点。
+    assert ask(r, "wild", "A").termination == "ent_nodata"
+    # x.ent 是存在节点的叶子下级：无 RRset 也无后代 → NXDOMAIN。
+    assert ask(r, "x.ent", "A").termination == "nxdomain"
     assert ask(r, "nothing", "A").termination == "nxdomain"
 
 
-def test_wildcard_expansion_and_deep_nonmatch():
+def test_wildcard_expansion_any_depth_and_blocking():
     r = res(zone(BASE))
     a = ask(r, "x.wild", "A")
     assert a.termination == "wildcard_expansion"
     assert a.wildcard_source == dns.name.from_text("*.wild.ex.")
     assert a.answer[0].rdata.address == "192.0.2.77"
-    # 多一层且中间无真实名称：通配不扩展（RFC 4592 closest encloser）。
-    assert ask(r, "a.b.wild", "A").termination == "nxdomain"
+    # 深层未列名同样命中最近包围名下的通配符（RFC 4592）。
+    deep = ask(r, "a.b.wild", "A")
+    assert deep.termination == "wildcard_expansion"
+    assert deep.wildcard_source == dns.name.from_text("*.wild.ex.")
+    assert deep.answer[0].owner == dns.name.from_text("a.b.wild.ex.")
+    assert deep.answer[0].rdata.address == "192.0.2.77"
+    # 更近的存在节点阻断上层通配：x.b.wild 使 b.wild 成为空非终结点，
+    # a.b.wild 的最近包围名变为 b.wild，*.wild 不再生效。
+    blk = res(zone(BASE + "x.b.wild A 192.0.2.99\n"))
+    assert ask(blk, "a.b.wild", "A").termination == "nxdomain"
+    assert ask(blk, "b.wild", "A").termination == "ent_nodata"
+    assert ask(blk, "x.b.wild", "A").termination == "exact"
 
 
 def test_dname_rewrite_and_synthesis():
     r = res(zone(BASE))
     a = ask(r, "x.d", "A")
-    # x.d 经 DNAME 合成 CNAME 指向 x.dt；x.dt 本身无记录，链末端为 NODATA，
-    # 但应答里仍含合成 CNAME（在前）与真实 DNAME（在后）。
+    # x.d 经 DNAME 合成 CNAME 指向 x.dt；x.dt 是 dt 的叶子下级（无 RRset
+    # 也无后代），链末端为 NXDOMAIN，但应答里仍含合成 CNAME（在前）与
+    # 真实 DNAME（在后）。
     assert a.hops[0].kind == "DNAME"
     assert a.answer[0].rdtype == dns.rdatatype.CNAME
     assert a.answer[1].rdtype == dns.rdatatype.DNAME
     assert a.answer[0].rdata.target == dns.name.from_text("x.dt.ex.")
-    # x.d 的最近真实祖先是 d（空非终结点路径），链末端名称 x.dt 不存在，
-    # 故终止原因为空非终结点 NODATA，但应答含完整 DNAME 合成链。
-    assert a.termination == "ent_nodata"
+    assert a.termination == "nxdomain"
     # 精确名 d 不触发 DNAME 合成。
     assert ask(r, "d", "A").termination == "noerror_nodata"
     # 目标子树存在记录时，沿 DNAME 链一路命中。
@@ -310,6 +322,26 @@ def test_known_a_changes():
     assert "*.wild" in scopes       # 通配地址变更
     assert "dt" in scopes           # DNAME 目标 A 变更
     assert "leaf.d" in scopes       # DNAME 拉回覆盖未列名
+    # 回归：新增 new A 不把叶子下级误判为存在——x.new 两版均为 NXDOMAIN，
+    # 不得误列 *.new / **.new。
+    assert "*.new" not in scopes
+    assert "**.new" not in scopes
+
+
+def test_new_leaf_record_keeps_children_nxdomain():
+    """候选新增 new A：x.new 仍为 NXDOMAIN，模式只覆盖应答变化的名称。"""
+    b, c = parse_zone(CHANGE_B, ORIGIN, label="b"), parse_zone(
+        CHANGE_C, ORIGIN, label="c")
+    for r in (res(b), res(c)):
+        assert ask(r, "x.new", "A").termination == "nxdomain"
+        assert ask(r, "a.b.new", "A").termination == "nxdomain"
+    qt = dns.rdatatype.A
+    patterns = analyze(b, c, [qt])[0].patterns
+    # x.new / a.b.new 未变化，不得落入任何模式。
+    for labs in (("x", "new"), ("a", "b", "new")):
+        assert not any(_in_pattern(labs, p) for p in patterns)
+    # 真实空非终结点（如通配符之父 wild）仍返回 ent_nodata。
+    assert ask(res(c), "wild", "A").termination == "ent_nodata"
 
 
 def test_dname_target_deep_unlisted_covered():
