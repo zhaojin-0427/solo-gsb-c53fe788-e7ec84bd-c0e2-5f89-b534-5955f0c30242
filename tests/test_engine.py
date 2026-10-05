@@ -142,8 +142,41 @@ def test_exact_and_cname_chain():
 def test_nodata_vs_ent_vs_nxdomain():
     r = res(zone(BASE))
     assert ask(r, "host", "NS").termination == "noerror_nodata"
-    assert ask(r, "x.ent", "A").termination == "ent_nodata"
+    # ent 在 BASE 里自身有 A 记录（是叶子），其下级 x.ent 不存在 → NXDOMAIN。
+    assert ask(r, "x.ent", "A").termination == "nxdomain"
     assert ask(r, "nothing", "A").termination == "nxdomain"
+    # 真实空非终结点：自身无 RRset、仅因后代 deep.node.ent 而存在；
+    # 查询其名得 NODATA，查询其不存在的下级仍得 NXDOMAIN。
+    ent_zone = zone(
+        "$ORIGIN ex.\n$TTL 60\n@ SOA ns hm 1 1 1 1 1\n NS ns\nns A 1.1.1.1\n"
+        "deep.node.ent A 192.0.2.22\n"
+    )
+    er = res(ent_zone)
+    assert ask(er, "node.ent", "A").termination == "ent_nodata"
+    assert ask(er, "node.ent", "NS").termination == "ent_nodata"
+    assert ask(er, "x.node.ent", "A").termination == "nxdomain"
+    assert ask(er, "a.b.node.ent", "A").termination == "nxdomain"
+    # 新增叶子名不会让其下级变成“存在”：x.leaf 仍 NXDOMAIN。
+    leaf_zone = zone(
+        "$ORIGIN ex.\n$TTL 60\n@ SOA ns hm 1 1 1 1 1\n NS ns\nns A 1.1.1.1\n"
+        "leaf A 192.0.2.33\n"
+    )
+    lr = res(leaf_zone)
+    assert ask(lr, "leaf", "A").termination == "exact"
+    assert ask(lr, "x.leaf", "A").termination == "nxdomain"
+    assert ask(lr, "a.x.leaf", "A").termination == "nxdomain"
+
+
+def test_wildcard_parent_existence():
+    # 只配置 *.p 时：x.p 命中通配；p 自身按 RFC 4592 A.1.1 仍为 NXDOMAIN
+    # （通配父节点不是空非终结点）；p 再下一层不扩展。
+    r = res(zone(
+        "$ORIGIN ex.\n$TTL 60\n@ SOA ns hm 1 1 1 1 1\n NS ns\nns A 1.1.1.1\n"
+        "*.p A 192.0.2.44\n"
+    ))
+    assert ask(r, "x.p", "A").termination == "wildcard_expansion"
+    assert ask(r, "p", "A").termination == "nxdomain"
+    assert ask(r, "a.x.p", "A").termination == "nxdomain"
 
 
 def test_wildcard_expansion_and_deep_nonmatch():
@@ -159,15 +192,14 @@ def test_wildcard_expansion_and_deep_nonmatch():
 def test_dname_rewrite_and_synthesis():
     r = res(zone(BASE))
     a = ask(r, "x.d", "A")
-    # x.d 经 DNAME 合成 CNAME 指向 x.dt；x.dt 本身无记录，链末端为 NODATA，
+    # x.d 经 DNAME 合成 CNAME 指向 x.dt；x.dt 自身无记录，其最近包围名为
+    # dt（dt 有 A 记录、是叶子），故 x.dt 不存在 → 链末端 NXDOMAIN，
     # 但应答里仍含合成 CNAME（在前）与真实 DNAME（在后）。
     assert a.hops[0].kind == "DNAME"
     assert a.answer[0].rdtype == dns.rdatatype.CNAME
     assert a.answer[1].rdtype == dns.rdatatype.DNAME
     assert a.answer[0].rdata.target == dns.name.from_text("x.dt.ex.")
-    # x.d 的最近真实祖先是 d（空非终结点路径），链末端名称 x.dt 不存在，
-    # 故终止原因为空非终结点 NODATA，但应答含完整 DNAME 合成链。
-    assert a.termination == "ent_nodata"
+    assert a.termination == "nxdomain"
     # 精确名 d 不触发 DNAME 合成。
     assert ask(r, "d", "A").termination == "noerror_nodata"
     # 目标子树存在记录时，沿 DNAME 链一路命中。
@@ -310,6 +342,73 @@ def test_known_a_changes():
     assert "*.wild" in scopes       # 通配地址变更
     assert "dt" in scopes           # DNAME 目标 A 变更
     assert "leaf.d" in scopes       # DNAME 拉回覆盖未列名
+
+
+def test_new_leaf_does_not_fabricate_descendant_patterns():
+    # 新增叶子 new：只允许精确模式 new；不得误报 *.new / **.new。
+    hdr = ("$ORIGIN ex.\n$TTL 60\n@ SOA ns hm {sn} 1 1 1 1\n NS ns\n"
+           "ns A 192.0.2.1\n")
+    b = parse_zone(hdr.format(sn=1), ORIGIN, label="b")
+    c = parse_zone(hdr.format(sn=2) + "new A 192.0.2.30\n",
+                   ORIGIN, label="c")
+    ps = analyze(b, c, [dns.rdatatype.A])[0].patterns
+    scopes = {p.scope.render() for p in ps}
+    assert scopes == {"new"}
+    # 其下级在两版里都不存在。
+    rb, rc = Resolver(b), Resolver(c)
+    for n in ("x.new", "a.x.new", "*.new"):
+        qn = dns.name.from_text(n, origin=b.origin)
+        a = rb.resolve(qn, dns.rdatatype.A)
+        z = rc.resolve(qn, dns.rdatatype.A)
+        assert a.termination == z.termination == "nxdomain", n
+
+
+def test_ent_patterns_cover_only_changed_names():
+    # 新增深层叶子 deep.node.ent：精确名 + 两级新 ENT，不多不少。
+    hdr = ("$ORIGIN ex.\n$TTL 60\n@ SOA ns hm {sn} 1 1 1 1\n NS ns\n"
+           "ns A 192.0.2.1\n")
+    b = parse_zone(hdr.format(sn=1), ORIGIN, label="b")
+    c = parse_zone(hdr.format(sn=2) + "deep.node.ent A 192.0.2.51\n",
+                   ORIGIN, label="c")
+    ps = analyze(b, c, [dns.rdatatype.A])[0].patterns
+    got = {p.scope.render(): (p.baseline.termination, p.candidate.termination)
+           for p in ps}
+    assert got == {
+        "deep.node.ent": ("nxdomain", "exact"),
+        "node.ent": ("nxdomain", "ent_nodata"),
+        "ent": ("nxdomain", "ent_nodata"),
+    }
+    rc = Resolver(c)
+    # ENT 的未列下级仍不存在。
+    for n in ("x.node.ent", "x.ent", "a.b.node.ent"):
+        a = rc.resolve(dns.name.from_text(n, origin=c.origin),
+                       dns.rdatatype.A)
+        assert a.termination == "nxdomain", n
+
+
+def test_nearer_node_blocks_upper_wildcard_in_diff():
+    # *.e 存在，候选新增精确叶子 leaf.e：leaf.e 变化，但其下级被阻断、
+    # 顶点其它未列名仍走通配，模式必须互斥完备。
+    hdr = ("$ORIGIN ex.\n$TTL 60\n@ SOA ns hm {sn} 1 1 1 1\n NS ns\n"
+           "ns A 192.0.2.1\n*.e A 192.0.2.40\n")
+    b = parse_zone(hdr.format(sn=1), ORIGIN, label="b")
+    c = parse_zone(hdr.format(sn=2) + "leaf.e A 192.0.2.41\n",
+                   ORIGIN, label="c")
+    ps = analyze(b, c, [dns.rdatatype.A])[0].patterns
+    scopes = {p.scope.render() for p in ps}
+    assert "leaf.e" in scopes
+    assert "e" in scopes               # 通配父升格为真实 ENT
+    rb, rc = Resolver(b), Resolver(c)
+    qt = dns.rdatatype.A
+    # 阻断：x.leaf.e 两版都是 NXDOMAIN，不属于任何模式。
+    qn = dns.name.from_text("x.leaf.e", origin=b.origin)
+    assert rb.resolve(qn, qt).termination == "nxdomain"
+    assert rc.resolve(qn, qt).termination == "nxdomain"
+    # 未受影响的通配名仍命中 *.e（未变化）。
+    qn2 = dns.name.from_text("other.e", origin=b.origin)
+    assert rc.resolve(qn2, qt).wildcard_source == dns.name.from_text(
+        "*.e.ex.")
+    assert_sound(b, c, "A", ["e", "leaf", "other", "x", "y", "ns"])
 
 
 def test_dname_target_deep_unlisted_covered():

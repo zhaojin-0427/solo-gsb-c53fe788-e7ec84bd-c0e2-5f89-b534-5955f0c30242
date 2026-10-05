@@ -44,6 +44,11 @@ class ZoneError(ValueError):
     """区域文本不合法或违反越区 / 外部引用约束。"""
 
 
+def _owner_is_wildcard(name: dns.name.Name) -> bool:
+    """属主是否为通配节点（最左标签为 ``*``，如 ``*.p``）。"""
+    return len(name.labels) >= 2 and name.labels[0] == b"*"
+
+
 @dataclass(frozen=True)
 class RR:
     owner: dns.name.Name
@@ -57,6 +62,15 @@ class ParsedZone:
     origin: dns.name.Name
     records: list[RR]
     rrsets: dict[dns.name.Name, dict[int, list[RR]]] = field(default_factory=dict)
+    # 空非终结点（empty non-terminal）：自身无任何 RRset，但作为某个
+    # **普通**属主的严格祖先而存在的结构点。它们没有叶子下级的“存在”
+    # 语义，却参与最近包围名 / 通配源 / NODATA 判定。
+    nonterminals: set[dns.name.Name] = field(default_factory=set)
+    # 通配父节点：通配属主 *.p 的父节点 p。RFC 4592 附录 A.1.1 把 p 视为
+    # 区域树中存在的节点（x.p 的最近包围名即 p，故 *.p 能命中 x.p），但
+    # p 自身在没有任何普通数据/普通后代时被查询仍是 NXDOMAIN——它与
+    # nonterminals（真实空非终结点）是两种不同的“存在”。
+    wildcard_parents: set[dns.name.Name] = field(default_factory=set)
     soa: RR | None = None
 
     def rdatasets(self, owner: dns.name.Name) -> dict[int, list[RR]]:
@@ -64,6 +78,20 @@ class ParsedZone:
 
     def has(self, owner: dns.name.Name) -> bool:
         return owner in self.rrsets
+
+    def is_nonterminal(self, owner: dns.name.Name) -> bool:
+        return owner in self.nonterminals
+
+    def enclosing_exists(self, owner: dns.name.Name) -> bool:
+        """名称能否作为最近包围名（路径上的存在节点）。
+
+        以下三者都算：拥有普通 RRset 的属主、真实空非终结点、通配属主的
+        父节点（RFC 4592 A.1.1）。通配属主本身（``*.p``）不作为普通查询
+        名路径上的包围名。
+        """
+        if owner in self.rrsets:
+            return not _owner_is_wildcard(owner)
+        return owner in self.nonterminals or owner in self.wildcard_parents
 
 
 # ---------------------------------------------------------------------------
@@ -408,5 +436,24 @@ def _build(origin, raw_records, label: str) -> ParsedZone:
                     raise ZoneError(
                         f"{label}: glue 属主 {rel(owner)} 只能有 A/AAAA 记录"
                     )
+
+    # 6) 结构点集合（存在性用于最近包围名 / 通配源判定）：
+    #    * nonterminals —— 每个普通属主在区域内、自身无 RRset 的严格祖先
+    #      （真实空非终结点；查询其名应得 NODATA）；
+    #    * wildcard_parents —— 每个通配属主 *.p 的父节点 p。按 RFC 4592
+    #      A.1.1，p 使 x.p 的最近包围名落在 p，从而 *.p 能命中 x.p；但 p
+    #      自身若无普通数据/普通后代，查询 p 仍是 NXDOMAIN，故不并入
+    #      nonterminals（普通通配的合成本不要求 p 真实存在）。
+    for owner in pz.rrsets:
+        if _owner_is_wildcard(owner):
+            parent = owner.parent()
+            if parent not in pz.rrsets:
+                pz.wildcard_parents.add(parent)
+            continue
+        cur = owner
+        while cur != origin:
+            cur = cur.parent()
+            if cur not in pz.rrsets:
+                pz.nonterminals.add(cur)
 
     return pz

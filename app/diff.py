@@ -180,10 +180,20 @@ def build_cells(
 ) -> list[Cell]:
     cells: list[Cell] = []
     for node in sorted(markers, key=lambda x: (len(x), x)):
+        # 字面通配属主（(*,P,...)）只建精确单元：名字 *.P 作为 P 的一标签
+        # 下级，已落在 P 的 star 空隙等价类中（其应答也由该探针见证）；
+        # 单独保留精确单元仅为区分“字面 * 名”与新鲜标签 w 的应答签名
+        # （两者在权威侧可能不同）。它的 star/deep 空隙（w.*.P 等）是不可
+        # 能的名字（通配符只能是最左标签），不建单元，否则会得到与父节点
+        # star 单元同集合、同渲染（*.P）的重复锥而相互重叠。
+        if node and node[0] == "*":
+            cells.append(Cell("exact", node, node))
+            continue
         w, ww = fresh_map[node]
-        # 1) 精确单元（字面 * 名也按精确名处理）。
+        # 1) 精确单元。
         cells.append(Cell("exact", node, node))
-        # 2) 一标签空隙：node 的直接下级中不属于任何标记子节点/字面*的名字。
+        # 2) 一标签空隙：node 的直接下级中不属于任何标记子节点的名字
+        #    （其中包含字面 * 属主；新鲜标签 w 与之同属一个等价类）。
         cells.append(Cell("star", node, (w,) + node))
         # 3) 多层空隙：ww 开头，下面再放一层 w，代表“进入未标记子树后”
         #    的任意深度名称。
@@ -301,7 +311,16 @@ def _emit_patterns(markers, resolved, changed_nodes, changed_star, changed_deep)
     """生成互斥完备的模式。
 
     每个变化单元对应一个锥（exact / star / sub）。按从具体到宽泛的顺序
-    发射；每个锥减去所有已发射、且位于其内部的更具体锥，从而保证：
+    发射；每个锥减去：
+
+    1. 所有已发射、且位于其内部的更具体锥（应答确实变化的子区域）；
+    2. 其名字集合内**应答未变**的已列名子区域——这些名字是探针空隙中的
+       “空洞”：star 探针代表的是“未列名一标签下级 + 字面通配符”等价类，
+       而已列名子节点各有独立签名；若通配符本身（空隙代表）发生变化而某
+       个真实子节点（如已有精确 A 的 www）两版应答不变，它必须被显式
+       排除，否则变化的 ``*.P`` 模式会错误地覆盖这个未变化的名字。
+
+    从而保证：
 
     * 模式内任一 (名称,类型) 的两版应答都变化；
     * 模式外的名称要么应答未变，要么属于另一个模式；
@@ -329,8 +348,55 @@ def _emit_patterns(markers, resolved, changed_nodes, changed_star, changed_deep)
             "exact": "exact", "star": "star", "sub": "deep"
         }[cone.kind]
         exclude = [c for c in emitted if _cone_within(c, cone)]
+
+        P = cone.labels
+        # 名字集合内“应答未变”的已列名空洞：探针空隙只代表未列名（+字面
+        # 通配符）等价类，而已列名子节点各有独立应答，必须显式排除。
+        if cone.kind in ("star", "sub"):
+            for m in markers:
+                is_star_name = bool(m) and m[0] == "*"
+
+                if cone.kind == "star":
+                    # *.P 只覆盖 P 的一标签下级，包括普通名 (L,)+P 与字面
+                    # 星号名 (*,)+P——对名字 "*" 的查询是精确名查询
+                    # （RFC 4592 2.1.1），不查通配 RRset，故它是空隙里独立
+                    # 于通配符的空洞。其精确应答未变时排除 exact(m)。
+                    if not (len(m) == len(P) + 1 and m[1:] == P):
+                        continue
+                    if m not in changed_nodes:
+                        exclude.append(Cone.exact(m))
+                    continue
+
+                # cone.kind == "sub"（**.P，含 P 自身及任意多层下级）。
+                # 字面 * 名只有在恰为某层一标签下级（(*,)+Q，Q 在 **.P 内）
+                # 时是真实名字；* 出现在第二层及更深（如 (*, L,)+Q）不可
+                # 能存在（通配符只能是最左标签），直接忽略。
+                if is_star_name:
+                    if (len(m) >= 2 and _suffix(m[1:], P)
+                            and m not in changed_nodes):
+                        exclude.append(Cone.exact(m))
+                    continue
+                if not _suffix(m, P):
+                    continue
+                # 普通标记点 m（精确应答未变时）：
+                #   * m 的多层空层（deep 单元）变化 → 变化区域从 m 以下两层
+                #     起步，排除精确点 exact(m)（一标签/深层变化各有独立、
+                #     与之不相交的锥承载）；
+                #   * 否则 m 的精确与多层单元都未变 → m 子树内若有变化也全
+                #     在已发射的更深锥内，整体排除 sub(m)。
+                if m not in changed_nodes:
+                    if m in changed_deep:
+                        exclude.append(Cone.exact(m))
+                    else:
+                        exclude.append(Cone.sub(m))
+
+        # 排除列表去重并稳定排序。
+        uniq: list[Cone] = []
+        for c in sorted(exclude, key=lambda c: (c.kind, c.labels)):
+            if c not in uniq:
+                uniq.append(c)
         patterns.append(Pattern(
-            scope=cone, exclude=exclude,
+            scope=cone, exclude=uniq,
             witness=a1.qname, witness_kind=kind,
             baseline=a1, candidate=a2,
         ))

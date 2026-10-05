@@ -19,12 +19,33 @@ BIND 文本（基线 `baseline` 与候选 `candidate`），枚举**域内所有�
 * 比较维度：**响应码（rcode）、RRset（忽略 TTL）、终止原因（termination）**。
 * 终止原因区分：
   * `exact` 精确命中；
-  * `wildcard_expansion` 最近祖先通配符扩展（RFC 4592 的“源即合点”）；
+  * `wildcard_expansion` 最近包围名的直接下级通配符扩展（RFC 4592 的
+    “源即合点”；通配 DNAME 还可按 RFC 6672 3.1.3 覆盖多层未列名）；
   * `delegation` 委派切点 referral（`AA=0`，authority 为 NS，glue 入 additional）；
-  * `noerror_nodata` 精确名称存在但无该类型；
-  * `ent_nodata` 空非终结点 NODATA（名字存在性来自祖先）；
+  * `noerror_nodata` 精确名称有 RRset 但无该类型（含通配一层命中但无该类型）；
+  * `ent_nodata` **空非终结点** NODATA：名字本身没有任何 RRset，但因为
+    拥有普通后代而存在（存在性来自后代）；
   * `nxdomain` 名称不存在；
   * `alias_loop` / `alias_chain_limit` 别名环 / 跳数上限——**只标记**，不当错误。
+
+### 名称存在性规则（关键）
+
+解析器把“无 RRset 的节点”分成两类，二者不可混淆：
+
+* **空非终结点（ENT）**：自身无 RRset，但在区域树里有**普通后代**（如只
+  配置了 `deep.ent`，则 `ent` 是 ENT）。查询其名返回 `ent_nodata`；它参与
+  最近包围名与通配源判定。
+* **叶子的下级**：一个仅有自身 RRset 的名字（如新增叶子 `new`）**不会**
+  让 `x.new` 变成存在节点——`x.new`、`a.x.new` 仍是 `nxdomain`，也不会
+  凭空产生 `*.new` / `**.new` 变更。
+
+最近包围名行走从查询名自身逐级向上，遇到的第一个“存在节点”（普通 RRset
+属主、ENT、或通配属主的父节点，RFC 4592 A.1.1）即停：
+
+* **深层未列名可命中最近包围名下的通配符**：`*.P` 能命中 `P` 的直接下级
+  （即使 `P` 自身无数据）；通配 DNAME 还能合成多层未列名。
+* **更近的存在节点阻断上层通配**：若 `leaf.e` 存在，则 `x.leaf.e` 的最近
+  包围名是 `leaf.e` 而非顶点，`*.e` / 顶点 `*` 一律不再扩展 → NXDOMAIN。
 * **CNAME / DNAME 逐跳重判**；DNAME 按 RFC 6672 在应答里合成一条 CNAME
   （合成 CNAME 在前、真实 DNAME 在后）。通配符 DNAME 也支持。
 * **DNAME 目标子树变化影响的“未列名”会被覆盖**：目标子树里的结构点会通过
@@ -104,9 +125,10 @@ curl -sS http://localhost:8080/impact \
   }'
 ```
 
-这次改动：`www` 的 A 改了地址；`api` 删了 A（变成 NODATA）；新增了 `new`。
+这次改动：`www` 的 A 改了地址；`api` 删了 A（变成 NODATA）；新增了
+叶子 `new`。
 
-### 真实响应（节选，完整含 5 个模式）
+### 真实响应（完整含 3 个模式）
 
 ```json
 {
@@ -114,10 +136,10 @@ curl -sS http://localhost:8080/impact \
   "compared_types": ["A"],
   "coverage": {
     "probe_cells_per_type": 15,
-    "changed_cells_total": 5,
+    "changed_cells_total": 3,
     "note": "probe_cells_per_type 个等价类覆盖域内全部名称；每个模式的 scope 减去 exclude 后两两互斥且并集恰为变更集。"
   },
-  "type_summary": [ { "type": "A", "changed_cells": 5, "patterns": 5 } ],
+  "type_summary": [ { "type": "A", "changed_cells": 3, "patterns": 3 } ],
   "patterns": [
     {
       "scope": { "selector": "api", "kind": "exact", "name": "api" },
@@ -146,6 +168,20 @@ curl -sS http://localhost:8080/impact \
       "types": ["A"]
     },
     {
+      "scope": { "selector": "new", "kind": "exact", "name": "new" },
+      "exclude": [],
+      "witness": { "name": "new", "probe_kind": "exact" },
+      "baseline": { "termination": "nxdomain", "rcode": "NXDOMAIN",
+                    "answer": [], "...": "..." },
+      "candidate": {
+        "termination": "exact", "rcode": "NOERROR",
+        "answer": [ { "name": "new", "type": "A", "ttl": 3600,
+                      "records": [ { "address": "192.0.2.30" } ] } ],
+        "...": "..."
+      },
+      "types": ["A"]
+    },
+    {
       "scope": { "selector": "www", "kind": "exact", "name": "www" },
       "exclude": [],
       "witness": { "name": "www", "probe_kind": "exact" },
@@ -156,45 +192,51 @@ curl -sS http://localhost:8080/impact \
         "answer": [ { "name": "www", "type": "A", "ttl": 3600,
                       "records": [ { "address": "192.0.2.11" } ] } ], "...": "..." },
       "types": ["A"]
-    },
-    {
-      "scope": { "selector": "new", "kind": "exact", "name": "new" },
-      "exclude": [],
-      "witness": { "name": "new", "probe_kind": "exact" },
-      "baseline": { "termination": "nxdomain", "rcode": "NXDOMAIN", "...": "..." },
-      "candidate": { "termination": "exact", "rcode": "NOERROR",
-        "answer": [ { "name": "new", "type": "A",
-                      "records": [ { "address": "192.0.2.30" } ] } ], "...": "..." },
-      "types": ["A"]
-    },
-    {
-      "scope": { "selector": "*.new", "kind": "star", "name": "new" },
-      "exclude": [],
-      "witness": { "name": "w-2.new", "probe_kind": "star" },
-      "baseline": { "termination": "nxdomain", "...": "..." },
-      "candidate": { "termination": "ent_nodata", "rcode": "NOERROR", "...": "..." },
-      "types": ["A"]
-    },
-    {
-      "scope": { "selector": "**.new", "kind": "sub", "name": "new" },
-      "exclude": [
-        { "selector": "new", "kind": "exact", "name": "new" },
-        { "selector": "*.new", "kind": "star", "name": "new" }
-      ],
-      "witness": { "name": "ww-2.w-2.new", "probe_kind": "deep" },
-      "baseline": { "termination": "nxdomain", "...": "..." },
-      "candidate": { "termination": "ent_nodata", "...": "..." },
-      "types": ["A"]
     }
   ]
 }
 ```
 
-注意最后一个模式 `**.new` 显式 `exclude` 了 `new` 与 `*.new`——这正是
-“零或多层、可排除子树”的含义：`new` 深层新增记录后，`a.new`、`a.b.new`
-等从 NXDOMAIN 变成空非终结点 NODATA，但 `new` 本身与 `*.new` 已由前两个
-模式单独表达。`w-2` / `ww-2` 是系统生成的、保证不与任何真实标签冲突的
-见证名。
+**新增叶子只产生一个精确模式**：`new` 从 NXDOMAIN 变成精确命中；它**不会**
+连带产生 `*.new` / `**.new`——`new` 是叶子，`x.new`、`a.x.new` 在候选版里
+依旧是 NXDOMAIN（见下节 `/resolve` 示例）。这与“只配置 `new` 时其下级
+不存在”的权威语义一致。
+
+### 真实空非终结点与通配阻断（/impact）
+
+```bash
+curl -sS http://localhost:8080/impact \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "origin": "example.",
+    "types": ["A"],
+    "baseline": "$ORIGIN example.\n$TTL 3600\n@ SOA ns1 hm 1 7200 3600 1209600 60\n NS ns1\nns1 A 192.0.2.1\n*.e A 192.0.2.40\n",
+    "candidate": "$ORIGIN example.\n$TTL 3600\n@ SOA ns1 hm 2 7200 3600 1209600 60\n NS ns1\nns1 A 192.0.2.1\n*.e A 192.0.2.40\nleaf.e A 192.0.2.41\ndeep.node.ent A 192.0.2.51\n"
+  }'
+```
+
+候选版新增了两条记录：`leaf.e`（落在已有通配 `*.e` 下）与
+`deep.node.ent`（全新多层名）。模式恰好为 5 个：
+
+```text
+deep.node.ent  nxdomain           -> exact            # 新叶子
+node.ent       nxdomain           -> ent_nodata       # 因 deep.node.ent 成为 ENT
+ent            nxdomain           -> ent_nodata       # 同上（两级祖先）
+e              nxdomain           -> ent_nodata       # 通配父 *.e 现又有普通后代
+leaf.e         wildcard_expansion -> exact            # 精确名压过通配
+```
+
+要点：
+
+* `node.ent` / `ent` 自身没有任何 RRset，但因获得普通后代而成为**空非
+  终结点**，对它们的查询由 NXDOMAIN 变为 `ent_nodata`；它们的其它下级
+  （如 `x.node.ent`、`x.ent`）仍是 NXDOMAIN，不产生额外模式。
+* 基线里 `e` 只是通配属主 `*.e` 的父节点（对 `e` 的查询是 NXDOMAIN）；
+  候选版有了普通后代 `leaf.e` 后它升格为真实 ENT → `ent_nodata`。
+* `leaf.e` 原本经 `*.e` 通配命中，加精确记录后变 `exact`；而 `x.leaf.e`
+  的最近包围名是 `leaf.e`，上层 `*.e` 被阻断，仍为 NXDOMAIN。
+* 只有“应答真的变化”的名字才进入模式集合；通配 / DNAME 覆盖的未列名区域
+  用 `*.prefix` / `**.prefix` 表达，并在 `exclude` 中挖掉应答未变的已列名点。
 
 ### 委派 / 通配 / DNAME 的应答长什么样
 
@@ -207,40 +249,58 @@ curl -sS http://localhost:8080/impact \
 
 ### `POST /resolve`：核对单个名称/类型
 
+下面核对**新增叶子 `new` 后，其下级 `x.new` 是否被误判**：
+
 ```bash
 curl -sS http://localhost:8080/resolve \
   -H 'Content-Type: application/json' \
   -d '{
     "origin": "example.",
-    "name": "www", "type": "A",
-    "baseline": "$ORIGIN example.\n$TTL 3600\n@ SOA ns1 hm 1 1 1 1 1\n NS ns1\nns1 A 192.0.2.1\nwww A 192.0.2.10\n",
-    "candidate": "$ORIGIN example.\n$TTL 3600\n@ SOA ns1 hm 2 1 1 1 1\n NS ns1\nns1 A 192.0.2.1\nwww A 192.0.2.11\n"
+    "name": "x.new", "type": "A",
+    "baseline": "$ORIGIN example.\n$TTL 3600\n@ SOA ns1 hm 1 1 1 1 1\n NS ns1\nns1 A 192.0.2.1\n",
+    "candidate": "$ORIGIN example.\n$TTL 3600\n@ SOA ns1 hm 2 1 1 1 1\n NS ns1\nns1 A 192.0.2.1\nnew A 192.0.2.30\n"
   }'
 ```
 
-响应：
+响应（节选）：候选版只多了叶子 `new`，`x.new` 的最近包围名仍是顶点，
+两版都是 **NXDOMAIN**，因此 `identical` 为 `true`——不会误报为
+`ent_nodata`，也不会产生 `*.new` / `**.new` 模式：
 
 ```json
 {
   "origin": "example.",
-  "qname": "www",
+  "qname": "x.new",
   "qtype": "A",
-  "identical": false,
-  "baseline": { "termination": "exact", "rcode": "NOERROR", "aa": true,
-    "answer": [ { "name": "www", "type": "A", "ttl": 3600,
-                  "records": [ { "address": "192.0.2.10" } ] } ],
-    "authority": [], "additional": [],
-    "wildcard_source": null, "dname_encloser": null, "alias_chain": [] },
-  "candidate": { "termination": "exact", "rcode": "NOERROR", "aa": true,
-    "answer": [ { "name": "www", "type": "A", "ttl": 3600,
-                  "records": [ { "address": "192.0.2.11" } ] } ],
-    "authority": [], "additional": [],
-    "wildcard_source": null, "dname_encloser": null, "alias_chain": [] }
+  "identical": true,
+  "baseline": {
+    "qname": "x.new", "qtype": "A", "rcode": "NXDOMAIN", "aa": true,
+    "termination": "nxdomain", "answer": [],
+    "authority": [ { "name": "@", "type": "SOA", "ttl": 3600,
+                     "records": [ { "mname": "ns1.example.",
+                                    "rname": "hm.example.", "serial": 1,
+                                    "refresh": 1, "retry": 1, "expire": 1,
+                                    "minimum": 1 } ] } ],
+    "additional": [],
+    "wildcard_source": null, "dname_encloser": null, "alias_chain": []
+  },
+  "candidate": {
+    "qname": "x.new", "qtype": "A", "rcode": "NXDOMAIN", "aa": true,
+    "termination": "nxdomain", "answer": [],
+    "authority": [ { "name": "@", "type": "SOA", "ttl": 3600,
+                     "records": [ { "mname": "ns1.example.",
+                                    "rname": "hm.example.", "serial": 2,
+                                    "refresh": 1, "retry": 1, "expire": 1,
+                                    "minimum": 1 } ] } ],
+    "additional": [],
+    "wildcard_source": null, "dname_encloser": null, "alias_chain": []
+  }
 }
 ```
 
-名称可相对 `origin`（`www`）或写绝对名；解析到区域外返回 `400
-out_of_zone`。
+对照：查询 `new` 本身，候选版从 `nxdomain` 变为 `exact`（`identical:false`）；
+把 `name` 换成真实空非终结点（如仅配置 `deep.node.ent` 时查询 `node.ent`），
+则得到 `termination: "ent_nodata"`。名称可相对 `origin`（`x.new`）或写绝对
+名；解析到区域外返回 `400 out_of_zone`。
 
 ### 错误响应（整单拒绝）
 
@@ -260,9 +320,9 @@ out_of_zone`。
 
 ```
 app/
-  zone.py       # BIND 逐记录解析 + 越区/外部引用/委派结构校验
-  resolver.py   # 离线权威解析：切点、ENT/NODATA、最近祖先通配、CNAME/DNAME 逐跳
-  diff.py       # 标记 trie、DNAME 拉回闭包、探针分区与互斥完备模式归并
+  zone.py       # BIND 逐记录解析 + 越区/外部引用/委派校验；构建空非终结点/通配父节点集合
+  resolver.py   # 离线权威解析：切点、最近包围名（含 ENT/通配父）、通配与 DNAME 合成、别名逐跳
+  diff.py       # 标记 trie、DNAME 拉回闭包、探针分区、未列名空洞排除与互斥完备模式归并
   serial.py     # Answer / Pattern 的 JSON 序列化
   main.py       # FastAPI：POST /impact、POST /resolve、GET /healthz
 tests/

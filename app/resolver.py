@@ -81,10 +81,6 @@ class Resolver:
         )
 
     # ------------------------------------------------------------------ utils
-    @staticmethod
-    def _is_wildcard(name: dns.name.Name) -> bool:
-        return len(name.labels) >= 2 and name.labels[0] == b"*"
-
     def _soa_rrset(self) -> list[RR]:
         # 否定应答（NODATA/NXDOMAIN）的 SOA 权威记录属主始终是区域顶点。
         soa = self.pz.soa
@@ -109,47 +105,50 @@ class Resolver:
         return RR(owner=owner, rdtype=dns.rdatatype.CNAME,
                   ttl=ttl, rdata=rdata)
 
-    def _find_source(self, qname: dns.name.Name):
-        """定位最长真实包围名与通配合成源。
+    def _find_enclosing(self, qname: dns.name.Name):
+        """定位最近包围名与其直接下级通配节点（RFC 4592 / RFC 6672）。
 
-        返回六元组：
-        ``(wildcard_name, wildcard_types, nearest_real, has_real_ancestor,
-        star_candidate, star_parent)``。
+        返回三元组 ``(encloser, wildcard_name, wildcard_types)``。
 
-        * ``wildcard_name`` 非空时是 RFC 4592 直接通配扩展；
-        * ``star_candidate`` 非空但 ``wildcard_name`` 为空时，说明存在一个
-          更深的通配符节点，其下级为 DNAME 时按 RFC 6672 3.1.3 合成
-          （``star_parent`` 即该通配符去掉 ``*`` 后的父名）。
+        存在性（能否成为包围名）来自
+        :meth:`ParsedZone.enclosing_exists`：有普通 RRset 的属主、**真实空
+        非终结点**（自身无 RRset 但有普通后代的结构点）以及通配属主的
+        父节点都算路径上的存在节点；叶子的下级（无任何后代者）不存在，
+        因此不会被当成包围名——例如新增叶子 ``new`` 后，``x.new`` 的最近
+        包围名仍是区域顶点，应答为 NXDOMAIN 而不是空非终结点 NODATA。
+
+        行走从 qname 自身逐级向上，直到第一个存在节点；通配节点
+        （``*.p``）本身不是普通路径上的名字，永不作为包围名。
+
+        ``wildcard_name`` 是包围名的直接下级 ``*.<encloser>``：
+
+        * 当 qname 恰比包围名深一层（qname 是“next closer name”）时，
+          该通配即 RFC 4592 的合成本源，对 A/CNAME 等直接扩展；
+        * 当 qname 比包围名深多层时，普通记录不扩展（名字不存在），
+          但 ``*.encloser`` 上若有 DNAME，按 RFC 6672 3.1.3 仍可合成，
+          此时由调用方据 qname 深度区分。
         """
-        nearest_real = self.origin
-        star_candidate: dns.name.Name | None = None
-        star_parent: dns.name.Name | None = None
-
-        cur = qname.parent()
+        encloser = self.origin
+        cur = qname
         while True:
-            if star_candidate is None:
-                cand = dns.name.Name([b"*"]).concatenate(cur)
-                if self.pz.has(cand):
-                    star_candidate = cand
-                    star_parent = cur
-            if self.pz.has(cur) and not self._is_wildcard(cur):
-                nearest_real = cur
+            if self.pz.enclosing_exists(cur):
+                encloser = cur
                 break
             if cur == self.origin:
                 break
             cur = cur.parent()
 
-        wildcard_name = None
-        wildcard_types = None
-        # RFC 4592：最深候选通配符 *.P 的父节点 P 恰为 qname 的父节点时，
-        # 通配合成生效（与 P 自身是否有非通配数据无关）。
-        if star_candidate is not None and star_parent == qname.parent():
-            wildcard_name = star_candidate
-            wildcard_types = self.pz.rdatasets(star_candidate)
-
-        has_real_ancestor = nearest_real != self.origin
-        return (wildcard_name, wildcard_types, nearest_real,
-                has_real_ancestor, star_candidate, star_parent)
+        # 包围名的直接下级通配：在 encloser 前加一层 ``*``。encloser 相对
+        # 起点的标签序列（最左在前）前置 * 后再拼回绝对起点，如
+        # encloser=wild.ex.（相对标签 (wild,)）→ *.wild.ex.；encloser 为
+        # 起点（相对标签为空）→ *.ex.。
+        rel = encloser.relativize(self.origin).labels
+        wildcard_name = dns.name.Name((b"*",) + rel).concatenate(self.origin)
+        wildcard_types = (
+            self.pz.rdatasets(wildcard_name)
+            if self.pz.has(wildcard_name) else None
+        )
+        return encloser, wildcard_name, wildcard_types
 
     # ------------------------------------------------------------------ core
     def _referral(self, qname: dns.name.Name, qtype: int,
@@ -168,12 +167,19 @@ class Resolver:
         )
 
     def _wildcard_dname(self, qname, qtype, wildcard_name, wc_types, encloser):
+        """通配符 DNAME 合成（RFC 6672 3.1.3）。
+
+        ``encloser`` 是最近包围名（通配源为其直接下级 ``*.encloser``）。
+        设 qname 相对包围名为 L1.L2...Ln.encloser（n>=1）：
+
+        * n=1（qname 恰为通配直接下级，普通通配扩展语义）：整体替换为
+          DNAME 目标，合成 CNAME 指向 target；
+        * n>1（深层未列名，只有 DNAME 能跨多层兜住）：仅最左标签 L1 被
+          DNAME 吞掉，其余 L2...Ln 保留，合成 CNAME 指向
+          L2...Ln.target。
+        """
         dname_rr = wc_types[dns.rdatatype.DNAME][0]
         target = dname_rr.rdata.target
-        # 设 qname 相对合成源父节点为 L1.L2...Ln.P（n>=1）。
-        # RFC 6672 3.1.3：单层（n=1）整体替换为 target；
-        # 多层时仅最左标签 L1 被 DNAME 吞掉，其余 L2...Ln 保留，
-        # 合成 CNAME 指向 L2...Ln.target。
         rel = qname.relativize(encloser)
         first = dns.name.from_text(rel.labels[0].decode(), origin=encloser)
         if len(rel.labels) == 1:
@@ -252,13 +258,17 @@ class Resolver:
             )
             return ans, None
 
-        # 3) 名称不存在：定位通配合成源与最近真实包围名。
-        (wildcard_name, wc_types, encloser, has_real_ancestor,
-         star_candidate, star_parent) = self._find_source(qname)
+        # 3) qname 自身无 RRset：定位最近包围名（含空非终结点）与包围名
+        #    直接下级通配节点。
+        encloser, wildcard_name, wc_types = self._find_enclosing(qname)
+        depth_below = len(qname.labels) - len(encloser.labels)
+        one_below = depth_below == 1
 
-        # 3a) 最近祖先通配符（RFC 4592 直接通配）。
+        # 3a) 包围名直接下级通配（RFC 4592）。
         if wc_types is not None:
-            if (dns.rdatatype.CNAME in wc_types
+            # 3a-i) 通配 CNAME 只在 qname 恰为包围名下一层时扩展。
+            if (one_below
+                    and dns.rdatatype.CNAME in wc_types
                     and qtype != dns.rdatatype.CNAME):
                 cname_rr = wc_types[dns.rdatatype.CNAME][0]
                 synthetic = self._make_cname_rr(
@@ -276,48 +286,55 @@ class Resolver:
                 )
                 return ans, hop
 
-            if dns.rdatatype.DNAME in wc_types:
+            # 3a-ii) 通配 DNAME：qname 严格位于包围名之下时合成。一层是
+            # 普通通配扩展；多层未列名也按 RFC 6672 3.1.3 合成（仅 DNAME
+            # 能跨多层，普通通配记录不行）。查询包围名本身不触发。
+            if depth_below > 0 and dns.rdatatype.DNAME in wc_types:
                 return self._wildcard_dname(
                     qname, qtype, wildcard_name, wc_types, encloser
                 )
 
-            if qtype in wc_types:
-                rrs = [
-                    RR(owner=qname, rdtype=rr.rdtype,
-                       ttl=rr.ttl, rdata=rr.rdata)
-                    for rr in wc_types[qtype]
-                ]
+            # 3a-iii) 一层且非 DNAME：按通配 RRset 取数据；无该类型即
+            # NODATA（通配节点的存在证明该层名字存在，不返回 NXDOMAIN）。
+            if one_below:
+                if qtype in wc_types:
+                    rrs = [
+                        RR(owner=qname, rdtype=rr.rdtype,
+                           ttl=rr.ttl, rdata=rr.rdata)
+                        for rr in wc_types[qtype]
+                    ]
+                    ans = Answer(
+                        qname=qname, qtype=qtype, rcode="NOERROR", aa=True,
+                        termination="wildcard_expansion",
+                        answer=rrs, wildcard_source=wildcard_name,
+                    )
+                    return ans, None
+
                 ans = Answer(
                     qname=qname, qtype=qtype, rcode="NOERROR", aa=True,
-                    termination="wildcard_expansion",
-                    answer=rrs, wildcard_source=wildcard_name,
+                    termination="noerror_nodata",
+                    authority=self._soa_rrset(),
+                    wildcard_source=wildcard_name,
                 )
                 return ans, None
 
-            ans = Answer(
-                qname=qname, qtype=qtype, rcode="NOERROR", aa=True,
-                termination="noerror_nodata",
-                authority=self._soa_rrset(),
-                wildcard_source=wildcard_name,
-            )
-            return ans, None
-
-        # 3a') 深层通配符节点：只有 DNAME 能覆盖（RFC 6672 3.1.3）。
-        if (wc_types is None and star_candidate is not None
-                and dns.rdatatype.DNAME
-                in self.pz.rdatasets(star_candidate)):
-            wc_dn_types = self.pz.rdatasets(star_candidate)
-            return self._wildcard_dname(
-                qname, qtype, star_candidate, wc_dn_types, star_parent
-            )
-
-        # 3b) 最近真实祖先上的精确 DNAME，仅对严格下级名合成。
+        # 3b) 最近包围名上的精确 DNAME，仅对其严格下级名合成
+        #     （通配 DNAME 已在 3a-ii 优先处理）。
         dn_types = self.pz.rdatasets(encloser)
-        if dns.rdatatype.DNAME in dn_types and qname != encloser:
+        if dns.rdatatype.DNAME in dn_types and depth_below > 0:
             return self._exact_dname(qname, qtype, encloser, dn_types)
 
-        # 3c) 路径上有真实节点 → 空非终结点 NODATA；否则 NXDOMAIN。
-        if has_real_ancestor:
+        # 3c) 终结判定：
+        #   * qname 即包围名本身且是真实空非终结点（有普通后代、自身无
+        #     RRset）→ 空非终结点 NODATA；
+        #   * qname 即包围名但仅因是通配父节点而“存在”（如只配置了 *.p），
+        #     对 p 自身的查询仍是 NXDOMAIN（RFC 4592 A.1.1）；
+        #   * qname 严格位于包围名之下 → next closer 名不存在，且无通配 /
+        #     DNAME 兜住它（更近的存在节点已阻断一切上层通配）→ NXDOMAIN。
+        #     包围名自身是叶子（有 RRset 但无后代）还是 ENT 并不影响：
+        #     其下级一律不存在，例如新增叶子 new 后 x.new 仍是 NXDOMAIN。
+        if depth_below == 0 and self.pz.is_nonterminal(qname):
+            # 真实空非终结点（有普通后代、自身无 RRset）→ NODATA。
             ans = Answer(
                 qname=qname, qtype=qtype, rcode="NOERROR", aa=True,
                 termination="ent_nodata",
@@ -325,6 +342,11 @@ class Resolver:
             )
             return ans, None
 
+        # qname == encloser 但仅因是“通配父节点”而存在（只有 *.qname），
+        # 或 qname 严格位于包围名之下（next closer 名不存在，且无通配 /
+        # DNAME 兜住；更近的存在节点已阻断一切上层通配）→ NXDOMAIN。
+        # 包围名自身是叶子（有 RRset 但无后代）还是 ENT 并不影响其下级：
+        # 一律不存在，例如新增叶子 new 后 x.new 仍是 NXDOMAIN。
         ans = Answer(
             qname=qname, qtype=qtype, rcode="NXDOMAIN", aa=True,
             termination="nxdomain",
